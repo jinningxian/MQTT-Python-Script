@@ -86,9 +86,9 @@ def test_bootstrap_rejects_unsigned_record_member(tmp_path):
 
 def test_project_metadata_and_source_scope_are_exact():
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    assert project["project"]["version"] == "0.1.1"
-    assert (ROOT / "VERSION").read_text(encoding="utf-8").strip() == "0.1.1"
-    handover = (ROOT / "docs" / "HANDOVER_0.1.1.md").read_text(encoding="utf-8")
+    assert project["project"]["version"] == "0.1.2"
+    assert (ROOT / "VERSION").read_text(encoding="utf-8").strip() == "0.1.2"
+    handover = (ROOT / "docs" / "HANDOVER_0.1.2.md").read_text(encoding="utf-8")
     assert "external task evidence" in handover
     assert "does not authorize commit" in handover
     assert project["project"]["requires-python"] == "==3.13.16"

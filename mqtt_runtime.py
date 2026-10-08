@@ -572,10 +572,19 @@ class _LifecycleClient:
                 self.close()
                 raise
 
-    def _termination_budget(self) -> float:
-        return min(1.0, max(0.1, self.config.shutdown_timeout / 4.0))
+    def _forced_cleanup_budget(self) -> float:
+        """Reserve a bounded interval for terminate/kill and final reaping."""
+        return min(2.0, max(0.7, self.config.shutdown_timeout / 2.0))
+
+    def _total_shutdown_budget(self) -> float:
+        return self.config.shutdown_timeout + self._forced_cleanup_budget()
+
+    @staticmethod
+    def _remaining(deadline: float) -> float:
+        return max(0.0, deadline - time.monotonic())
 
     def _perform_shutdown(self) -> None:
+        deadline = time.monotonic() + self._total_shutdown_budget()
         with self._state_lock:
             process = self._process
             connection = self._connection
@@ -588,16 +597,18 @@ class _LifecycleClient:
                 self._send("STOP")
             except (BrokenPipeError, EOFError, OSError):
                 pass
-            process.join(self.config.shutdown_timeout)
-        budget = self._termination_budget()
+            process.join(min(self.config.shutdown_timeout, self._remaining(deadline)))
         if process.is_alive():
             process.terminate()
-            process.join(budget)
+            remaining = self._remaining(deadline)
+            terminate_probe = min(0.1, remaining / 4.0)
+            if terminate_probe > 0:
+                process.join(terminate_probe)
         if process.is_alive():
             process.kill()
-            process.join(budget)
+            process.join(self._remaining(deadline))
         if process.is_alive():
-            raise ShutdownError("MQTT child remained alive after terminate/kill/join budgets")
+            raise ShutdownError("MQTT child remained alive at the absolute shutdown deadline")
         if connection is not None:
             connection.close()
         process.close()
@@ -615,7 +626,7 @@ class _LifecycleClient:
                 owner = True
                 self._state = ClientState.STOPPING
         if not owner:
-            total = self.config.shutdown_timeout + 2 * self._termination_budget() + 0.5
+            total = self._total_shutdown_budget()
             if not self._closed.wait(total):
                 raise TimeoutError("MQTT client shutdown owner exceeded its finite budget")
             if self._shutdown_error is not None:

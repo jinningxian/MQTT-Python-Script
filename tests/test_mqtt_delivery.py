@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import replace
 import logging
 import multiprocessing
@@ -30,6 +31,39 @@ def wait_until(predicate, timeout: float = 8.0) -> None:
 
 def _send_fault_event(connection, session, generation, kind, **fields):
     connection.send({"protocol": 1, "session": session, "generation": generation, "kind": kind, **fields})
+
+
+def _cpu_pressure_worker(stop, ready):
+    ready.set()
+    value = 1
+    while not stop.is_set():
+        for _ in range(100_000):
+            value = ((value * 1_103_515_245) + 12_345) & 0x7FFFFFFF
+        time.sleep(0.001)
+
+
+@contextmanager
+def cpu_pressure():
+    """Run one bounded CPU worker and prove it is absent on exit."""
+    context = multiprocessing.get_context("spawn")
+    stop = context.Event()
+    ready = context.Event()
+    worker = context.Process(target=_cpu_pressure_worker, args=(stop, ready), daemon=True)
+    worker.start()
+    assert ready.wait(3)
+    try:
+        yield
+    finally:
+        stop.set()
+        worker.join(1)
+        if worker.is_alive():
+            worker.terminate()
+            worker.join(1)
+        if worker.is_alive():
+            worker.kill()
+            worker.join(1)
+        assert not worker.is_alive()
+        worker.close()
 
 
 def fault_engine(connection, _config, role, session, options):
@@ -65,6 +99,12 @@ def fault_engine(connection, _config, role, session, options):
                 _send_fault_event(connection, session, generation, "READY", mid=11)
     else:
         _send_fault_event(connection, session, generation, "READY")
+
+    if mode == "ipc_loss":
+        connection.close()
+        mark_entered()
+        while True:
+            time.sleep(1)
 
     while True:
         if not connection.poll(0.05):
@@ -326,9 +366,10 @@ def test_close_kills_child_blocked_in_connect(mqtt_broker):
     worker = threading.Thread(target=lambda: _capture_failure(client.start, failures))
     worker.start()
     assert entered.wait(3)
-    began = time.monotonic()
-    client.close()
-    elapsed = time.monotonic() - began
+    with cpu_pressure():
+        began = time.monotonic()
+        client.close()
+        elapsed = time.monotonic() - began
     worker.join(2)
     assert elapsed < 1.0
     assert not worker.is_alive() and failures and isinstance(failures[0], TimeoutError)
@@ -346,9 +387,10 @@ def test_close_kills_child_blocked_in_shutdown_stage(mqtt_broker, mode):
         engine_options={"mode": mode, "entered": entered},
     )
     client.start()
-    began = time.monotonic()
-    client.close()
-    elapsed = time.monotonic() - began
+    with cpu_pressure():
+        began = time.monotonic()
+        client.close()
+        elapsed = time.monotonic() - began
     assert entered.is_set()
     assert elapsed < 1.0
     assert client.state is ClientState.CLOSED and not client.owned_process_alive
@@ -369,7 +411,8 @@ def test_close_during_accepted_publish_returns_unknown_once(mqtt_broker):
     worker = threading.Thread(target=lambda: results.append(publisher.publish("cancel-after-accept")))
     worker.start()
     assert entered.wait(3)
-    publisher.close()
+    with cpu_pressure():
+        publisher.close()
     worker.join(2)
     assert not worker.is_alive()
     assert len(results) == 1 and results[0].outcome is PublishOutcome.UNKNOWN
@@ -446,13 +489,36 @@ def test_close_is_idempotent_and_concurrent_waiter_is_bounded(mqtt_broker):
     failures: list[BaseException] = []
     first = threading.Thread(target=lambda: _capture_failure(client.close, failures))
     second = threading.Thread(target=lambda: _capture_failure(client.close, failures))
-    first.start()
-    assert entered.wait(3)
-    second.start()
-    first.join(2)
-    second.join(2)
+    with cpu_pressure():
+        began = time.monotonic()
+        first.start()
+        assert entered.wait(3)
+        second.start()
+        first.join(2)
+        second.join(2)
+        elapsed = time.monotonic() - began
     client.close()
     assert not first.is_alive() and not second.is_alive() and failures == []
+    assert elapsed < 1.0
+    assert client.state is ClientState.CLOSED and not client.owned_process_alive
+
+
+def test_ipc_loss_reaps_live_child_under_cpu_pressure(mqtt_broker):
+    _server, base = mqtt_broker
+    context = multiprocessing.get_context("spawn")
+    entered = context.Event()
+    client = Publisher(
+        replace(base, shutdown_timeout=0.15),
+        engine_target=fault_engine,
+        engine_options={"mode": "ipc_loss", "entered": entered},
+    )
+    client.start()
+    assert entered.wait(3)
+    with cpu_pressure():
+        began = time.monotonic()
+        client.close()
+        elapsed = time.monotonic() - began
+    assert elapsed < 1.0
     assert client.state is ClientState.CLOSED and not client.owned_process_alive
 
 
