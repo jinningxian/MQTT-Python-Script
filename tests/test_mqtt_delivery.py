@@ -10,14 +10,17 @@ import time
 
 import pytest
 
+import mqtt_runtime as mqtt_module
 from mqtt_runtime import (
     ClientState,
     PublishOutcome,
     Publisher,
     Subscriber,
+    _ShutdownSchedule,
     _SubscriptionDecision,
     _SubscriptionTracker,
 )
+from runtime_config import MQTTConfig
 
 
 def wait_until(predicate, timeout: float = 8.0) -> None:
@@ -66,7 +69,7 @@ def cpu_pressure():
         worker.close()
 
 
-def fault_engine(connection, _config, role, session, options):
+def fault_engine(connection, _config, role, session, shared_stop, options):
     """Picklable spawned fault engine; it never opens a socket."""
     options = dict(options or {})
     mode = options.get("mode", "normal")
@@ -107,12 +110,20 @@ def fault_engine(connection, _config, role, session, options):
             time.sleep(1)
 
     while True:
+        if bool(shared_stop.value):
+            if mode in {"block_disconnect", "block_loop_stop"}:
+                mark_entered()
+                while True:
+                    time.sleep(1)
+            _send_fault_event(connection, session, generation, "TERMINAL", failure_class="None")
+            return
         if not connection.poll(0.05):
             continue
         command = connection.recv()
         if not isinstance(command, dict) or command.get("session") != session:
             continue
         if command.get("kind") == "STOP":
+            shared_stop.value = 1
             if mode in {"block_disconnect", "block_loop_stop"}:
                 mark_entered()
                 while True:
@@ -151,6 +162,160 @@ def fault_engine(connection, _config, role, session, options):
             )
 
 
+def _bounded_test_config() -> MQTTConfig:
+    return MQTTConfig(
+        host="127.0.0.1",
+        port=1883,
+        topic="fixture/shutdown",
+        username="fixture-user",
+        password="fixture-password-not-production",
+        qos=1,
+        retain=False,
+        keepalive=10,
+        connect_timeout=5.0,
+        publish_timeout=5.0,
+        shutdown_timeout=0.15,
+        client_id_prefix="fixture",
+        reconnect_min_delay=1,
+        reconnect_max_delay=2,
+        ca_file=None,
+    )
+
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self.now = 100.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += max(0.0, seconds)
+
+
+class _FakeConnection:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def poll(self, timeout: float = 0.0) -> bool:
+        return False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeProcess:
+    def __init__(self, clock: _FakeClock, *, reap_after_kill: bool = True, late_terminate: float = 0.0) -> None:
+        self.clock = clock
+        self.reap_after_kill = reap_after_kill
+        self.late_terminate = late_terminate
+        self.alive = True
+        self.exitcode = None
+        self.killed = False
+        self.closed = False
+        self.actions: list[tuple[str, float | None]] = []
+
+    def is_alive(self) -> bool:
+        return self.alive
+
+    def join(self, timeout: float | None = None) -> None:
+        self.actions.append(("join", timeout))
+        self.clock.advance(0.0 if timeout is None else timeout)
+        if self.killed and self.reap_after_kill:
+            self.alive = False
+            self.exitcode = -9
+
+    def terminate(self) -> None:
+        self.actions.append(("terminate", None))
+        self.clock.advance(self.late_terminate)
+
+    def kill(self) -> None:
+        self.actions.append(("kill", None))
+        self.killed = True
+
+    def close(self) -> None:
+        self.actions.append(("close", None))
+        self.closed = True
+
+
+def test_shutdown_schedule_reserves_post_kill_reaping_budget():
+    active = _ShutdownSchedule.create(
+        started_at=10.0,
+        shutdown_timeout=0.15,
+        forced_cleanup_budget=0.7,
+        cooperative=True,
+    )
+    connecting = _ShutdownSchedule.create(
+        started_at=10.0,
+        shutdown_timeout=0.15,
+        forced_cleanup_budget=0.7,
+        cooperative=False,
+    )
+    assert active.overall_deadline == pytest.approx(10.85)
+    assert active.cooperative_deadline == pytest.approx(10.15)
+    assert active.terminate_deadline == pytest.approx(10.20)
+    assert active.kill_not_later_than == pytest.approx(10.20)
+    assert active.kill_reap_reserve == pytest.approx(0.65)
+    assert connecting.cooperative_deadline == pytest.approx(10.0)
+    assert connecting.terminate_deadline == pytest.approx(10.05)
+    assert connecting.kill_not_later_than == pytest.approx(10.20)
+    assert connecting.kill_reap_reserve == pytest.approx(0.65)
+
+
+@pytest.mark.parametrize(
+    ("state", "expects_cooperative", "expected_kill_join"),
+    [
+        (ClientState.CONNECTING, False, 0.80),
+        (ClientState.RECONNECTING, False, 0.80),
+        (ClientState.ACTIVE, True, 0.65),
+    ],
+)
+def test_shutdown_ignored_terminate_preserves_kill_reap_budget(
+    monkeypatch, state, expects_cooperative, expected_kill_join,
+):
+    clock = _FakeClock()
+    process = _FakeProcess(clock)
+    connection = _FakeConnection()
+    client = Publisher(_bounded_test_config(), engine_target=fault_engine)
+    client._state = state
+    client._process = process
+    client._connection = connection
+    monkeypatch.setattr(mqtt_module.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(client, "_send", lambda *_args, **_kwargs: pytest.fail("shutdown used pipe STOP"))
+
+    client.close()
+
+    phases = tuple(name for name, _elapsed in client._shutdown_trace)
+    joins = [timeout for action, timeout in process.actions if action == "join"]
+    assert ("cooperative-join" in phases) is expects_cooperative
+    assert phases[-2:] == ("kill", "reap-observed")
+    assert joins[-1] == pytest.approx(expected_kill_join)
+    assert clock.now - 100.0 == pytest.approx(0.85)
+    assert client._shutdown_exitcode == -9
+    assert client.state is ClientState.CLOSED and not client.owned_process_alive
+    assert process.closed and connection.closed
+
+
+def test_shutdown_late_parent_fails_closed_and_retains_process_handle(monkeypatch):
+    clock = _FakeClock()
+    process = _FakeProcess(clock, reap_after_kill=False, late_terminate=1.0)
+    connection = _FakeConnection()
+    client = Publisher(_bounded_test_config(), engine_target=fault_engine)
+    client._state = ClientState.CONNECTING
+    client._process = process
+    client._connection = connection
+    monkeypatch.setattr(mqtt_module.time, "monotonic", clock.monotonic)
+
+    with pytest.raises(mqtt_module.ShutdownError, match="remained alive"):
+        client.close()
+
+    assert client.state is ClientState.STOPPING
+    assert client._process is process and client.owned_process_alive
+    assert not process.closed and not connection.closed
+    assert client._shutdown_trace[-1][0] == "reap-unproven"
+    assert client._shutdown_exitcode is None
+
+
 @pytest.mark.parametrize("qos", [0, 1, 2])
 def test_loopback_delivery_qos(mqtt_broker, qos):
     _server, base = mqtt_broker
@@ -171,6 +336,9 @@ def test_loopback_delivery_qos(mqtt_broker, qos):
     assert not publisher.loop_started and not subscriber.loop_started
     assert not publisher.owned_process_alive and not subscriber.owned_process_alive
     assert publisher.state is ClientState.CLOSED and subscriber.state is ClientState.CLOSED
+    assert "cooperative-join" in {phase for phase, _elapsed in publisher._shutdown_trace}
+    assert "cooperative-join" in {phase for phase, _elapsed in subscriber._shutdown_trace}
+    assert publisher._shutdown_exitcode == 0 and subscriber._shutdown_exitcode == 0
 
 
 def test_retained_message_reaches_late_subscriber_and_is_cleared(mqtt_broker):
@@ -374,6 +542,9 @@ def test_close_kills_child_blocked_in_connect(mqtt_broker):
     assert elapsed < 1.0
     assert not worker.is_alive() and failures and isinstance(failures[0], TimeoutError)
     assert client.state is ClientState.CLOSED and not client.owned_process_alive
+    assert "cooperative-join" not in {phase for phase, _elapsed in client._shutdown_trace}
+    assert client._shutdown_trace[-1][0] == "reap-observed"
+    assert client._shutdown_exitcode is not None
 
 
 @pytest.mark.parametrize("mode", ["block_disconnect", "block_loop_stop"])
@@ -394,6 +565,9 @@ def test_close_kills_child_blocked_in_shutdown_stage(mqtt_broker, mode):
     assert entered.is_set()
     assert elapsed < 1.0
     assert client.state is ClientState.CLOSED and not client.owned_process_alive
+    assert "cooperative-join" in {phase for phase, _elapsed in client._shutdown_trace}
+    assert client._shutdown_trace[-1][0] == "reap-observed"
+    assert client._shutdown_exitcode is not None
 
 
 def test_close_during_accepted_publish_returns_unknown_once(mqtt_broker):
@@ -419,6 +593,11 @@ def test_close_during_accepted_publish_returns_unknown_once(mqtt_broker):
     assert results[0].operation_id == publisher.last_operation_id
     assert send_count.value == 1
     assert publisher.state is ClientState.CLOSED and not publisher.owned_process_alive
+    phases = tuple(phase for phase, _elapsed in publisher._shutdown_trace)
+    assert phases[:2] == ("stop-signaled", "inflight-publish-force")
+    assert "cooperative-join" not in phases
+    assert phases[-1] == "reap-observed"
+    assert publisher._shutdown_exitcode is not None
 
 
 def test_child_crash_after_admission_is_unknown_and_never_replayed(mqtt_broker):
@@ -501,6 +680,8 @@ def test_close_is_idempotent_and_concurrent_waiter_is_bounded(mqtt_broker):
     assert not first.is_alive() and not second.is_alive() and failures == []
     assert elapsed < 1.0
     assert client.state is ClientState.CLOSED and not client.owned_process_alive
+    assert client._shutdown_trace[-1][0] == "reap-observed"
+    assert client._shutdown_exitcode is not None
 
 
 def test_ipc_loss_reaps_live_child_under_cpu_pressure(mqtt_broker):

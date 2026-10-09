@@ -73,6 +73,45 @@ class ShutdownError(RuntimeError):
     """The owned child could not be proven absent inside the finite budget."""
 
 
+@dataclass(frozen=True, slots=True)
+class _ShutdownSchedule:
+    """Immutable phase deadlines that preserve time for post-kill reaping."""
+
+    started_at: float
+    cooperative_deadline: float
+    terminate_deadline: float
+    kill_not_later_than: float
+    overall_deadline: float
+    kill_reap_reserve: float
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        started_at: float,
+        shutdown_timeout: float,
+        forced_cleanup_budget: float,
+        cooperative: bool,
+    ) -> _ShutdownSchedule:
+        terminate_grace = min(0.05, forced_cleanup_budget / 8.0)
+        kill_reap_reserve = forced_cleanup_budget - terminate_grace
+        overall_deadline = started_at + shutdown_timeout + forced_cleanup_budget
+        kill_not_later_than = overall_deadline - kill_reap_reserve
+        cooperative_deadline = min(
+            started_at + (shutdown_timeout if cooperative else 0.0),
+            kill_not_later_than - terminate_grace,
+        )
+        terminate_deadline = min(cooperative_deadline + terminate_grace, kill_not_later_than)
+        return cls(
+            started_at=started_at,
+            cooperative_deadline=cooperative_deadline,
+            terminate_deadline=terminate_deadline,
+            kill_not_later_than=kill_not_later_than,
+            overall_deadline=overall_deadline,
+            kill_reap_reserve=kill_reap_reserve,
+        )
+
+
 class _SubscriptionDecision(str, Enum):
     ACCEPTED = "ACCEPTED"
     DENIED = "DENIED"
@@ -140,7 +179,14 @@ def _event(session: str, generation: int, kind: str, **fields: object) -> dict[s
 class _PahoChildEngine:
     """Runs only in the spawned child process."""
 
-    def __init__(self, connection: Connection, config: MQTTConfig, role: str, session: str) -> None:
+    def __init__(
+        self,
+        connection: Connection,
+        config: MQTTConfig,
+        role: str,
+        session: str,
+        shared_stop: object,
+    ) -> None:
         self.connection = connection
         self.config = config
         self.role = role
@@ -148,10 +194,14 @@ class _PahoChildEngine:
         self.generation = 0
         self._send_lock = threading.Lock()
         self._stop = threading.Event()
+        self._shared_stop = shared_stop
         self._disconnected = threading.Event()
         self._fatal = threading.Event()
         self._tracker = _SubscriptionTracker()
         self._client: mqtt.Client | None = None
+
+    def _stop_requested(self) -> bool:
+        return self._stop.is_set() or bool(getattr(self._shared_stop, "value", 0))
 
     def send(self, kind: str, **fields: object) -> None:
         message = _event(self.session, self.generation, kind, **fields)
@@ -184,7 +234,7 @@ class _PahoChildEngine:
         return client
 
     def _on_connect(self, generation: int, client: mqtt.Client, reason_code: object) -> None:
-        if generation != self.generation or self._stop.is_set():
+        if generation != self.generation or self._stop_requested():
             return
         if _reason_failed(reason_code):
             self.send("START_FAILED", failure_class="ConnectionRejected")
@@ -212,12 +262,12 @@ class _PahoChildEngine:
 
     def _on_disconnect(self, generation: int) -> None:
         self._tracker.invalidate(generation)
-        if generation == self.generation and not self._stop.is_set():
+        if generation == self.generation and not self._stop_requested():
             self.send("DISCONNECTED")
             self._disconnected.set()
 
     def _on_message(self, generation: int, message: object) -> None:
-        if generation != self.generation or self._stop.is_set():
+        if generation != self.generation or self._stop_requested():
             return
         self.send(
             "MESSAGE",
@@ -268,6 +318,7 @@ class _PahoChildEngine:
             return
         kind = command.get("kind")
         if kind == "STOP":
+            self._shared_stop.value = 1
             self._stop.set()
         elif kind == "PUBLISH" and self.role == "publisher":
             self._publish(command)
@@ -287,7 +338,7 @@ class _PahoChildEngine:
 
     def _sleep_with_commands(self, seconds: float) -> None:
         deadline = time.monotonic() + seconds
-        while not self._stop.is_set() and time.monotonic() < deadline:
+        while not self._stop_requested() and time.monotonic() < deadline:
             self._poll_command(min(0.05, max(0.0, deadline - time.monotonic())))
 
     def _run_generation(self) -> None:
@@ -306,7 +357,7 @@ class _PahoChildEngine:
                 return
             client.loop_start()
             loop_started = True
-            while not (self._stop.is_set() or self._disconnected.is_set() or self._fatal.is_set()):
+            while not (self._stop_requested() or self._disconnected.is_set() or self._fatal.is_set()):
                 self._poll_command(0.05)
         finally:
             try:
@@ -319,13 +370,13 @@ class _PahoChildEngine:
 
     def run(self) -> None:
         delay = float(self.config.reconnect_min_delay)
-        while not (self._stop.is_set() or self._fatal.is_set()):
+        while not (self._stop_requested() or self._fatal.is_set()):
             self._run_generation()
-            if self._stop.is_set() or self._fatal.is_set():
+            if self._stop_requested() or self._fatal.is_set():
                 break
             self._sleep_with_commands(delay)
             delay = min(delay * 2, float(self.config.reconnect_max_delay))
-        self.send("TERMINAL", failure_class="None" if self._stop.is_set() else "FatalProtocolState")
+        self.send("TERMINAL", failure_class="None" if self._stop_requested() else "FatalProtocolState")
 
 
 def _mqtt_child_main(
@@ -333,10 +384,11 @@ def _mqtt_child_main(
     config: MQTTConfig,
     role: str,
     session: str,
+    shared_stop: object,
     _options: Mapping[str, object] | None = None,
 ) -> None:
     try:
-        _PahoChildEngine(connection, config, role, session).run()
+        _PahoChildEngine(connection, config, role, session, shared_stop).run()
     except BaseException as exc:
         try:
             connection.send(_event(session, 0, "TERMINAL", failure_class=type(exc).__name__))
@@ -346,7 +398,7 @@ def _mqtt_child_main(
         connection.close()
 
 
-EngineTarget = Callable[[Connection, MQTTConfig, str, str, Mapping[str, object] | None], None]
+EngineTarget = Callable[[Connection, MQTTConfig, str, str, object, Mapping[str, object] | None], None]
 
 
 class _LifecycleClient:
@@ -363,6 +415,7 @@ class _LifecycleClient:
         self._engine_target = engine_target
         self._engine_options = dict(engine_options or {})
         self._context = multiprocessing.get_context("spawn")
+        self._stop_signal = self._context.RawValue("b", 0)
         self._session = secrets.token_hex(16)
         self._state = ClientState.CREATED
         self._generation = 0
@@ -373,6 +426,8 @@ class _LifecycleClient:
         self._operation_lock = threading.Lock()
         self._closed = threading.Event()
         self._shutdown_error: BaseException | None = None
+        self._shutdown_trace: tuple[tuple[str, float], ...] = ()
+        self._shutdown_exitcode: int | None = None
         self._process: multiprocessing.Process | None = None
         self._connection: Connection | None = None
         self._pending_events: deque[dict[str, object]] = deque()
@@ -425,7 +480,7 @@ class _LifecycleClient:
         parent, child = self._context.Pipe(duplex=True)
         process = self._context.Process(
             target=self._engine_target,
-            args=(child, self.config, self._role, self._session, self._engine_options),
+            args=(child, self.config, self._role, self._session, self._stop_signal, self._engine_options),
             name=f"mqtt-{self._role}-engine",
             daemon=True,
         )
@@ -583,31 +638,53 @@ class _LifecycleClient:
     def _remaining(deadline: float) -> float:
         return max(0.0, deadline - time.monotonic())
 
-    def _perform_shutdown(self) -> None:
-        deadline = time.monotonic() + self._total_shutdown_budget()
+    def _perform_shutdown(self, pre_close_state: ClientState) -> None:
+        started_at = time.monotonic()
+        publish_in_flight = self._role == "publisher" and self._operation_lock.locked()
+        cooperative = pre_close_state is ClientState.ACTIVE and not publish_in_flight
+        schedule = _ShutdownSchedule.create(
+            started_at=started_at,
+            shutdown_timeout=self.config.shutdown_timeout,
+            forced_cleanup_budget=self._forced_cleanup_budget(),
+            cooperative=cooperative,
+        )
+        trace: list[tuple[str, float]] = []
+
+        def record(phase: str) -> None:
+            trace.append((phase, max(0.0, time.monotonic() - started_at)))
+
+        def save_trace(exitcode: int | None) -> None:
+            with self._state_lock:
+                self._shutdown_trace = tuple(trace)
+                self._shutdown_exitcode = exitcode
+
         with self._state_lock:
             process = self._process
             connection = self._connection
+        self._stop_signal.value = 1
+        record("stop-signaled")
+        if publish_in_flight:
+            record("inflight-publish-force")
         if process is None:
             if connection is not None:
                 connection.close()
+            save_trace(None)
             return
-        if process.is_alive():
-            try:
-                self._send("STOP")
-            except (BrokenPipeError, EOFError, OSError):
-                pass
-            process.join(min(self.config.shutdown_timeout, self._remaining(deadline)))
-        if process.is_alive():
+        if process.is_alive() and cooperative:
+            record("cooperative-join")
+            process.join(self._remaining(schedule.cooperative_deadline))
+        if process.is_alive() and time.monotonic() < schedule.kill_not_later_than:
+            record("terminate")
             process.terminate()
-            remaining = self._remaining(deadline)
-            terminate_probe = min(0.1, remaining / 4.0)
-            if terminate_probe > 0:
-                process.join(terminate_probe)
+            process.join(self._remaining(schedule.terminate_deadline))
         if process.is_alive():
+            record("kill")
             process.kill()
-            process.join(self._remaining(deadline))
-        if process.is_alive():
+            process.join(self._remaining(schedule.overall_deadline))
+        exitcode = process.exitcode
+        record("reap-observed" if not process.is_alive() and exitcode is not None else "reap-unproven")
+        save_trace(exitcode)
+        if process.is_alive() or exitcode is None:
             raise ShutdownError("MQTT child remained alive at the absolute shutdown deadline")
         if connection is not None:
             connection.close()
@@ -622,8 +699,10 @@ class _LifecycleClient:
                 return
             if self._state is ClientState.STOPPING:
                 owner = False
+                pre_close_state = ClientState.STOPPING
             else:
                 owner = True
+                pre_close_state = self._state
                 self._state = ClientState.STOPPING
         if not owner:
             total = self._total_shutdown_budget()
@@ -633,7 +712,7 @@ class _LifecycleClient:
                 raise ShutdownError("MQTT client shutdown did not complete cleanly") from self._shutdown_error
             return
         try:
-            self._perform_shutdown()
+            self._perform_shutdown(pre_close_state)
         except BaseException as exc:
             with self._state_lock:
                 self._shutdown_error = exc

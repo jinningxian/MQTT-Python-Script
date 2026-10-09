@@ -52,8 +52,8 @@ python sendMessage.py
 The historical SFTP function names remain as secured wrappers:
 `getConnect`, `uploadFile`, and `downloadFile`.
 
-Release version: `0.1.2`. The current security handover is documented in
-`docs/HANDOVER_0.1.2.md`; the 0.1.0 and 0.1.1 handovers are retained as
+Release version: `0.1.3`. The current security handover is documented in
+`docs/HANDOVER_0.1.3.md`; the 0.1.0 through 0.1.2 handovers are retained as
 historical candidate evidence. Exact source and validation hashes live in the
 external task evidence handoff generated after the source writer lease is
 released.
