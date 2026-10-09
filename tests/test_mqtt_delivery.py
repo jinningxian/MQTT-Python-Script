@@ -11,6 +11,11 @@ import time
 import pytest
 
 import mqtt_runtime as mqtt_module
+from mqtt_test_spawn_support import (
+    cpu_pressure_worker,
+    exit_before_ready_worker,
+    wait_without_ready_worker,
+)
 from mqtt_runtime import (
     ClientState,
     PublishOutcome,
@@ -36,37 +41,100 @@ def _send_fault_event(connection, session, generation, kind, **fields):
     connection.send({"protocol": 1, "session": session, "generation": generation, "kind": kind, **fields})
 
 
-def _cpu_pressure_worker(stop, ready):
-    ready.set()
-    value = 1
-    while not stop.is_set():
-        for _ in range(100_000):
-            value = ((value * 1_103_515_245) + 12_345) & 0x7FFFFFFF
-        time.sleep(0.001)
-
-
 @contextmanager
-def cpu_pressure():
-    """Run one bounded CPU worker and prove it is absent on exit."""
+def cpu_pressure(*, target=cpu_pressure_worker):
+    """Run one bounded pressure worker and prove it is absent on every exit."""
     context = multiprocessing.get_context("spawn")
     stop = context.Event()
     ready = context.Event()
-    worker = context.Process(target=_cpu_pressure_worker, args=(stop, ready), daemon=True)
-    worker.start()
-    assert ready.wait(3)
+    worker = context.Process(target=target, args=(stop, ready), daemon=True)
+    started = False
     try:
+        worker.start()
+        started = True
+        deadline = time.monotonic() + 3.0
+        while not ready.is_set():
+            exitcode = worker.exitcode
+            if exitcode is not None:
+                error = AssertionError(
+                    "pressure worker exited before readiness: "
+                    f"pid={worker.pid} alive={worker.is_alive()} exitcode={exitcode}"
+                )
+                error.worker_pid = worker.pid
+                raise error
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                error = AssertionError(
+                    "pressure worker did not become ready within 3 seconds: "
+                    f"pid={worker.pid} alive={worker.is_alive()} exitcode={worker.exitcode}"
+                )
+                error.worker_pid = worker.pid
+                raise error
+            ready.wait(min(0.02, remaining))
         yield
     finally:
-        stop.set()
-        worker.join(1)
-        if worker.is_alive():
-            worker.terminate()
+        if started:
+            stop.set()
             worker.join(1)
-        if worker.is_alive():
-            worker.kill()
-            worker.join(1)
-        assert not worker.is_alive()
-        worker.close()
+            if worker.is_alive():
+                worker.terminate()
+                worker.join(1)
+            if worker.is_alive():
+                worker.kill()
+                worker.join(1)
+            alive = worker.is_alive()
+            exitcode = worker.exitcode
+            pid = worker.pid
+            if alive or exitcode is None:
+                raise AssertionError(
+                    "pressure worker cleanup could not prove absence: "
+                    f"pid={pid} alive={alive} exitcode={exitcode}"
+                )
+            worker.close()
+
+
+def test_cpu_pressure_start_failure_preserves_exception_without_unstarted_cleanup(monkeypatch):
+    calls = []
+
+    class FakeEvent:
+        pass
+
+    class FailingProcess:
+        def start(self):
+            calls.append("start")
+            raise OSError("synthetic pressure start failure")
+
+        def __getattribute__(self, name):
+            if name not in {"start", "__class__", "__dict__", "__getattribute__"}:
+                raise AssertionError(f"unstarted process was touched: {name}")
+            return object.__getattribute__(self, name)
+
+    class FakeContext:
+        def Event(self):
+            return FakeEvent()
+
+        def Process(self, **_kwargs):
+            return FailingProcess()
+
+    monkeypatch.setattr(multiprocessing, "get_context", lambda _method: FakeContext())
+    with pytest.raises(OSError, match="synthetic pressure start failure"):
+        with cpu_pressure():
+            pytest.fail("an unstarted pressure worker cannot yield")
+    assert calls == ["start"]
+
+
+def test_cpu_pressure_timeout_reaps_worker():
+    with pytest.raises(AssertionError, match="did not become ready within 3 seconds") as failure:
+        with cpu_pressure(target=wait_without_ready_worker):
+            pytest.fail("a pressure worker without readiness cannot yield")
+    assert failure.value.worker_pid not in {child.pid for child in multiprocessing.active_children()}
+
+
+def test_cpu_pressure_pre_ready_exit_reports_exitcode_and_reaps_worker():
+    with pytest.raises(AssertionError, match=r"exited before readiness: .*exitcode=23") as failure:
+        with cpu_pressure(target=exit_before_ready_worker):
+            pytest.fail("a pressure worker that exited cannot yield")
+    assert failure.value.worker_pid not in {child.pid for child in multiprocessing.active_children()}
 
 
 def fault_engine(connection, _config, role, session, shared_stop, options):

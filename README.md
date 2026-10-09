@@ -16,6 +16,9 @@ the caller's secret store. The application does not load `.env` files.
   caller-thread IPC and applies a finite terminate/kill/join shutdown bound.
   QoS 1 may duplicate and QoS 2 is exactly-once only at the MQTT protocol
   boundary. Raw payloads do not contain a durable application message ID.
+- Shutdown pressure tests launch their CPU worker from a lightweight
+  stdlib-only module. Startup, readiness timeout, early exit, and normal exit
+  all use the same bounded reap-and-close cleanup path.
 - A subscriber becomes active only after a successful generation- and
   MID-bound SUBACK. Messages are delivered by `Subscriber.receive()` or
   caller-thread `Subscriber.run(handler)`; the 0.1.0 candidate-only callback
@@ -52,8 +55,8 @@ python sendMessage.py
 The historical SFTP function names remain as secured wrappers:
 `getConnect`, `uploadFile`, and `downloadFile`.
 
-Release version: `0.1.3`. The current security handover is documented in
-`docs/HANDOVER_0.1.3.md`; the 0.1.0 through 0.1.2 handovers are retained as
+Release version: `0.1.4`. The current security handover is documented in
+`docs/HANDOVER_0.1.4.md`; the 0.1.0 through 0.1.3 handovers are retained as
 historical candidate evidence. Exact source and validation hashes live in the
 external task evidence handoff generated after the source writer lease is
 released.

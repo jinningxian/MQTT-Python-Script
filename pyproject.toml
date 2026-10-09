@@ -1,6 +1,6 @@
 [project]
 name = "mqtt-python-script"
-version = "0.1.3"
+version = "0.1.4"
 description = "Fail-closed MQTT and atomic SFTP command-line adapters"
 readme = "README.md"
 requires-python = "==3.13.16"

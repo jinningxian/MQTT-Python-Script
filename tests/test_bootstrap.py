@@ -86,9 +86,9 @@ def test_bootstrap_rejects_unsigned_record_member(tmp_path):
 
 def test_project_metadata_and_source_scope_are_exact():
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    assert project["project"]["version"] == "0.1.3"
-    assert (ROOT / "VERSION").read_text(encoding="utf-8").strip() == "0.1.3"
-    handover = (ROOT / "docs" / "HANDOVER_0.1.3.md").read_text(encoding="utf-8")
+    assert project["project"]["version"] == "0.1.4"
+    assert (ROOT / "VERSION").read_text(encoding="utf-8").strip() == "0.1.4"
+    handover = (ROOT / "docs" / "HANDOVER_0.1.4.md").read_text(encoding="utf-8")
     assert "external task evidence" in handover
     assert "does not authorize commit" in handover
     assert project["project"]["requires-python"] == "==3.13.16"
@@ -102,6 +102,21 @@ def test_project_metadata_and_source_scope_are_exact():
         path.read_text(encoding="utf-8", errors="strict")
         for path in ROOT.glob("*.py")
     ).lower()
+
+
+def test_pressure_spawn_support_is_stdlib_only():
+    path = ROOT / "mqtt_test_spawn_support.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=path.name)
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".", 1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".", 1)[0])
+    assert imported == {"__future__", "time"}
+    source = path.read_text(encoding="utf-8")
+    for forbidden in ("pytest", "mqtt_runtime", "runtime_config", "paho", "amqtt", "cryptography"):
+        assert forbidden not in source
 
 
 def test_application_has_no_import_time_prompt_or_literal_auth_call():
